@@ -1,4 +1,5 @@
 import base64
+import fractions
 import io as pyio
 import logging
 import queue
@@ -8,7 +9,9 @@ import time
 import numpy as np
 import torch
 
+import comfy.model_base
 import comfy.model_management
+import comfy.utils
 import comfy.patcher_extension
 try:
     import comfy.model_prefetch
@@ -145,9 +148,11 @@ if _HAS_MP4 and not _MP4_AVAILABLE:
 _mp4_warned = False
 
 
-def _encode_mp4(frames, fps, max_res):
+def _encode_mp4(frames, fps, max_res, audio=None):
     # Fragmented MP4 so the browser can decode mid-download. Returns (None, 0, 0) when every
     # candidate fails (including too-small frames), so caller falls through to WebP.
+    # audio: optional ([2, L] float32 in [-1, 1], sample_rate) muxed as an AAC track; fps may be a
+    # Fraction so the clip's duration matches the audio
     global _mp4_warned
     if not frames:
         return None, 0, 0
@@ -183,11 +188,14 @@ def _encode_mp4(frames, fps, max_res):
                 buf, mode="w", format="mp4",
                 options={"movflags": "frag_keyframe+empty_moov+default_base_moof"},
             )
-            stream = container.add_stream(codec, rate=int(max(1, fps)))
+            rate = fps if isinstance(fps, fractions.Fraction) else int(max(1, fps))
+            stream = container.add_stream(codec, rate=rate)
             stream.width = out_w
             stream.height = out_h
             stream.pix_fmt = "yuv420p"
             stream.options = opts
+            # every stream must exist before the first mux writes the header
+            astream = container.add_stream("aac", rate=int(audio[1]), layout="stereo") if audio is not None else None
             for pf in pil_frames:
                 vf = av.VideoFrame.from_ndarray(np.ascontiguousarray(pf), format="rgb24") if isinstance(pf, np.ndarray) \
                     else av.VideoFrame.from_image(pf)
@@ -195,6 +203,8 @@ def _encode_mp4(frames, fps, max_res):
                     container.mux(pkt)
             for pkt in stream.encode():
                 container.mux(pkt)
+            if astream is not None:
+                _mux_aac(container, av, astream, audio[0], audio[1])
             container.close()
             return base64.b64encode(buf.getvalue()).decode("ascii"), out_w, out_h
         except Exception as e:
@@ -204,6 +214,16 @@ def _encode_mp4(frames, fps, max_res):
         _mp4_warned = True
         logging.warning(f"[KJ PreviewOverride] MP4 encode failed, using WebP fallback: {last_err}")
     return None, 0, 0
+
+
+def _mux_aac(container, av, astream, wave, sample_rate):
+    # wave [2, L] float32 in [-1, 1]; mirrors core's VideoFromComponents.save_to: one whole-clip
+    # frame at pts 0, the codec's own FIFO does the AAC framing
+    frame = av.AudioFrame.from_ndarray(np.ascontiguousarray(wave, dtype=np.float32), format="fltp", layout="stereo")
+    frame.sample_rate = int(sample_rate)
+    frame.pts = 0
+    container.mux(astream.encode(frame))
+    container.mux(astream.encode(None))
 
 
 def _encode_animated_webp(frames, fps, quality, max_res):
@@ -376,11 +396,12 @@ def _tiny_vae_decode_frames(decoder, x0, max_frames=None, compile_preview=False)
     # every step, so the decode joins the sampler thread's allocation graph and every GPU tensor is
     # gone before the scope closes. Needs a core with per-thread graphs; older cores skip it.
     if x0.ndim not in (4, 5):
-        return None
+        return None, None
     compiled = compile_preview and comfy.model_prefetch is not None and comfy.model_prefetch.malloc_graph_enabled(x0.device)
     if compiled:
         comfy.model_prefetch.malloc_graph_begin(x0.device)
     try:
+        span = None
         if x0.ndim == 4:
             frames = decoder.decode(x0[:1])
         else:
@@ -389,11 +410,14 @@ def _tiny_vae_decode_frames(decoder, x0, max_frames=None, compile_preview=False)
                 picks = np.linspace(0, len(indices) - 1, max_frames).round().astype(int).tolist()
                 indices = [indices[i] for i in picks]
             frames = decoder.decode_video(x0[:1], frame_indices=indices)
+            # the temporal decoder chains memblock state, so a partial request decodes the prefix instead
+            prefix = getattr(decoder, "decodes_prefix", False) and len(indices) < x0.shape[2]
+            span = (0, len(indices) - 1) if prefix else (indices[0], indices[-1])
         frames = None if frames is None or frames.shape[0] == 0 else frames.cpu()
     finally:
         if compiled:
             comfy.model_prefetch.malloc_graph_end()
-    return frames
+    return frames, span
 
 
 def _materialize_frames(frames, max_res=0):
@@ -409,7 +433,7 @@ def _as_pil(frame):
 
 
 def _tiny_vae_decode_to_pil(decoder, x0, max_frames=None, compile_preview=False):
-    frames = _tiny_vae_decode_frames(decoder, x0, max_frames, compile_preview)
+    frames, _ = _tiny_vae_decode_frames(decoder, x0, max_frames, compile_preview)
     return [] if frames is None else [_as_pil(a) for a in _frames_to_arrays(frames, 0)]
 
 
@@ -438,6 +462,88 @@ def _ltx_num_keyframes(guider):
     return 0
 
 
+def _is_av_model(model):
+    # core marks audio+video models by model type; other packed latents (e.g. shape + camera) are not audio
+    flow_av = getattr(comfy.model_base.ModelType, "FLOW_AV", None)
+    return flow_av is not None and getattr(model, "model_type", None) == flow_av
+
+
+def _packed_audio_latent(x0, latent_shapes):
+    # AV models pack every stream into one [B, 1, N] tensor; the audio stream is the last entry, as
+    # core's vae_decode_audio picks it
+    if x0.ndim != 3 or not latent_shapes or len(latent_shapes) < 2:
+        return None
+    try:
+        return comfy.utils.unpack_latents(x0, latent_shapes)[-1]
+    except Exception:
+        return None
+
+
+def _frames_per_token(latent_format):
+    # pixel frames each latent token stands for, cycled: MiniMax H3 codes 17 frames per 5 tokens,
+    # the causal VAEs one frame then temporal_downscale_ratio per token
+    if type(latent_format).__name__.startswith("MiniMaxH3"):
+        return (1, 4, 4, 4, 4)
+    return (1, max(1, int(getattr(latent_format, "temporal_downscale_ratio", 1))))
+
+
+def _token_span_fraction(span, n_tokens, pattern):
+    # fraction of the clip covered by latent tokens [first, last]; the audio latent spans the whole clip
+    if span is None or n_tokens <= 1:
+        return 0.0, 1.0
+    def frames(k):
+        if len(pattern) == 2:
+            return 0 if k <= 0 else 1 + (k - 1) * pattern[1]
+        return sum(pattern[i % len(pattern)] for i in range(k))
+    first, last = span
+    total = frames(n_tokens)
+    return frames(first) / total, min(1.0, frames(last + 1) / total)
+
+
+_SPEC_LUT = None
+_HANN = {}
+
+
+def _spec_colormap():
+    # black -> purple -> orange -> yellow -> white, 256 entries
+    global _SPEC_LUT
+    if _SPEC_LUT is None:
+        anchors = np.array([[0, 0, 0], [60, 10, 90], [180, 50, 60], [240, 130, 30], [250, 210, 60], [255, 255, 230]], dtype=np.float32)
+        pos = np.linspace(0, 1, len(anchors))
+        x = np.linspace(0, 1, 256)
+        _SPEC_LUT = np.stack([np.interp(x, pos, anchors[:, c]) for c in range(3)], axis=1).astype(np.uint8)
+    return _SPEC_LUT
+
+
+def _strip_to_png(mag, width=512, height=64):
+    # mag [rows, cols] >= 0, low rows = low frequency; drawn bottom-up, normalized per strip
+    mag = np.asarray(mag, dtype=np.float32)
+    if mag.ndim != 2 or mag.size == 0:
+        return None
+    hi = float(np.percentile(mag, 99.5))
+    norm = np.clip(mag / hi, 0, 1) ** 0.6 if hi > 0 else np.zeros_like(mag)
+    img = Image.fromarray(_spec_colormap()[(norm[::-1] * 255).astype(np.uint8)], "RGB")
+    img = img.resize((width, height), Image.BILINEAR)
+    buf = pyio.BytesIO()
+    img.save(buf, format="PNG", optimize=False)
+    return base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+def _wave_strip(wave, sample_rate, bands=64):
+    # [2, L] -> log-magnitude STFT folded into log-spaced bands
+    x = torch.as_tensor(wave, dtype=torch.float32).mean(0)
+    n_fft = 1024
+    hop = max(256, x.shape[0] // 800)
+    window = _HANN.get(n_fft)
+    if window is None:
+        window = _HANN[n_fft] = torch.hann_window(n_fft)
+    spec = torch.stft(x, n_fft, hop_length=hop, window=window, return_complex=True).abs()
+    edges = np.unique(np.geomspace(1, spec.shape[0] - 1, bands + 1).round().astype(int))
+    rows = [spec[edges[i]:max(edges[i + 1], edges[i] + 1)].mean(0) for i in range(len(edges) - 1)]
+    mag = torch.log1p(torch.stack(rows) * 10).numpy()
+    return _strip_to_png(mag)
+
+
 def _normalize_packed_x0(x0, latent_shapes, num_keyframes):
     # Restore standard video latents from flattened packs
     if latent_shapes and len(latent_shapes) > 0:
@@ -453,7 +559,7 @@ def _normalize_packed_x0(x0, latent_shapes, num_keyframes):
 
 
 class _PreviewOverrideWrapper:
-    def __init__(self, max_resolution, node_id, jpeg_quality, suppress_default, preview_frames=1, preview_fps=12, vae=None, tiny_vae="none"):
+    def __init__(self, max_resolution, node_id, jpeg_quality, suppress_default, preview_frames=1, preview_fps=12, vae=None, tiny_vae="none", audio_vae=None):
         self.max_resolution = max_resolution
         self.node_id = str(node_id) if node_id is not None else None
         self.jpeg_quality = jpeg_quality
@@ -462,6 +568,7 @@ class _PreviewOverrideWrapper:
         self.preview_fps = preview_fps
         self.vae = vae
         self.tiny_vae = tiny_vae
+        self.audio_vae = audio_vae
         self.frames = []
 
     def __call__(self, executor, noise, latent_image, sampler, sigmas, denoise_mask, callback, disable_pbar, seed, latent_shapes):
@@ -611,16 +718,53 @@ class _PreviewOverrideWrapper:
         anim_fps = self.preview_fps
 
 
+        # audio: with an audio VAE and an animated preview the audio latent is decoded each step,
+        # muxed into the MP4 in real time, and its spectrogram drawn under the graphs
+        has_audio_latent = _is_av_model(model_patcher.model) and _packed_audio_latent(noise, latent_shapes) is not None
+        audio_vae = self.audio_vae if (has_audio_latent and animate_video) else None
+        audio_rate = 0
+        frame_pattern = _frames_per_token(model_patcher.model.latent_format)
+        # the sampler carries the audio stream scaled by audio_scale and only process_latent_out undoes it
+        audio_scale = getattr(model_patcher.model, "audio_scale", None)
+        audio_scale = float(audio_scale()) if callable(audio_scale) else 1.0
+        if audio_vae is not None:
+            # core's vae_decode_audio prefers the output rate; the LTX audio VAE only sets that one
+            audio_rate = int(getattr(audio_vae, "audio_sample_rate_output", None) or getattr(audio_vae, "audio_sample_rate", 0) or 0)
+            if audio_rate <= 0:
+                logging.warning("[KJ PreviewOverride] audio_vae has no sample rate; audio preview disabled")
+                audio_vae = None
+        if audio_vae is not None:
+            # VAE.decode runs model management on every call (gc sweep, cache flush); load once here and
+            # go through the raw model per step instead
+            try:
+                audio_shape = tuple(_packed_audio_latent(noise, latent_shapes).shape)
+                comfy.model_management.load_models_gpu(
+                    [audio_vae.patcher], memory_required=audio_vae.memory_used_decode(audio_shape, audio_vae.vae_dtype),
+                    force_full_load=getattr(audio_vae, "disable_offload", False))
+            except Exception as e:
+                logging.warning(f"[KJ PreviewOverride] could not load audio_vae, audio preview disabled: {e}")
+                audio_vae = None
+
+        def decode_audio(audio_latent):
+            # mirrors VAE.decode minus the batching: [B, 32, 2, T] -> [B, 2, L] -> [2, L] float32 CPU, with
+            # core's VAEDecodeAudio level trim
+            z = (audio_latent / audio_scale).to(device=audio_vae.device, dtype=audio_vae.vae_dtype)
+            wave = audio_vae.process_output(audio_vae.first_stage_model.decode(z))
+            wave = wave[:1].float().cpu()
+            std = torch.std(wave, dim=[1, 2], keepdim=True) * 5.0
+            std[std < 1.0] = 1.0
+            return (wave / std)[0].clamp_(-1, 1).numpy()
+
         def produce_frames(x0_view):
-            # a [T, 3, H, W] CPU tensor from the tiny VAE, else a PIL list from whichever previewer
-            # applies, else []
+            # (frames, span): a [T, 3, H, W] CPU tensor from the tiny VAE, else a PIL list from
+            # whichever previewer applies, else []; span = latent tokens (first, last) the frames cover
             nonlocal tiny_vae
             max_pil = anim_frames if animate_video else 1
             if tiny_vae is not None:
                 try:
-                    frames = _tiny_vae_decode_frames(tiny_vae, x0_view, max_frames=max_pil, compile_preview=compile_preview)
+                    frames, span = _tiny_vae_decode_frames(tiny_vae, x0_view, max_frames=max_pil, compile_preview=compile_preview)
                     if frames is not None:
-                        return frames
+                        return frames, span
                 except Exception as e:
                     # OOM at 16x upscale is the likely cause — drop to the cheap paths for good.
                     logging.warning(f"[KJ PreviewOverride] tiny VAE decode failed, falling back: {e}")
@@ -656,7 +800,7 @@ class _PreviewOverrideWrapper:
                             f"Preview override: {type(previewer).__name__} returned "
                             f"{type(out).__name__} instead of PIL.Image — falling back to Latent2RGB."
                         )
-            return pil_frames
+            return pil_frames, None
 
         def new_callback(step, x0, x, total_steps_):
             if previewer is not None or fallback_previewer is not None or ltx_previewer is not None or tiny_vae is not None:
@@ -664,7 +808,7 @@ class _PreviewOverrideWrapper:
                     # NEVER rebind x0 — the sampler reuses the same tensor downstream
                     # (unpack_latents reshapes it). Preview mutations stay on x0_view.
                     x0_view = _normalize_packed_x0(x0, latent_shapes, num_keyframes)
-                    frames = produce_frames(x0_view)
+                    frames, span = produce_frames(x0_view)
 
                     if isinstance(frames, torch.Tensor):
                         pil_first = _frame_to_pil(frames[0])
@@ -687,6 +831,16 @@ class _PreviewOverrideWrapper:
                         prev_x0_cpu = state["last_x0_cpu"]
                         state["last_x0_cpu"] = x0_cpu_now
 
+                        audio_wave = None
+                        n_tokens = int(x0_view.shape[2]) if x0_view.ndim == 5 else 1
+                        if audio_vae is not None:
+                            audio_latent = _packed_audio_latent(x0, latent_shapes)
+                            if audio_latent is not None:
+                                try:
+                                    audio_wave = decode_audio(audio_latent)
+                                except Exception as e:
+                                    logging.warning(f"[KJ PreviewOverride] audio decode failed: {e}")
+
                         now = time.perf_counter()
                         step_ms = None
                         if state["last_time"] is not None:
@@ -701,19 +855,40 @@ class _PreviewOverrideWrapper:
                         sent_step = step + 1
 
                         def _encode_and_send(
-                            frames=frames, x0_cpu_now=x0_cpu_now, prev_x0_cpu=prev_x0_cpu,
+                            frames=frames, span=span, x0_cpu_now=x0_cpu_now, prev_x0_cpu=prev_x0_cpu,
+                            audio_wave=audio_wave, n_tokens=n_tokens,
                             step_ms=step_ms, avg_step_ms=avg_step_ms, sigma_val=sigma_val,
                             sent_step=sent_step, total_steps_=total_steps_,
                         ):
                             frames = _materialize_frames(frames, max_res)
+                            frac = _token_span_fraction(span, n_tokens, frame_pattern)
+                            audio = None
+                            fps_out = anim_fps
+                            if audio_wave is not None and len(frames) > 1:
+                                total = audio_wave.shape[1]
+                                s0 = int(frac[0] * total)
+                                s1 = max(int(frac[1] * total), s0 + audio_rate // 10)
+                                clip = audio_wave[:, s0:s1]
+                                if clip.shape[1] > 0:
+                                    audio = (clip, audio_rate)
+                                    fps_out = fractions.Fraction(len(frames) * audio_rate, clip.shape[1]).limit_denominator(1000)
+                            spec_b64 = None
+                            if audio is not None:
+                                try:
+                                    spec_b64 = _wave_strip(audio[0], audio_rate)
+                                except Exception as e:
+                                    logging.warning(f"[KJ PreviewOverride] spectrogram failed: {e}")
+
                             if len(frames) > 1:
                                 # MP4 is far faster and smaller than PIL WebP when an encoder is available.
                                 b64, w_, h_, mime = None, 0, 0, None
                                 if _MP4_AVAILABLE:
-                                    b64, w_, h_ = _encode_mp4(frames, anim_fps, max_res)
+                                    b64, w_, h_ = _encode_mp4(frames, fps_out, max_res, audio=audio)
                                     if b64:
                                         mime = "video/mp4"
                                 if not b64:
+                                    audio = None
+                                    fps_out = anim_fps
                                     b64, w_, h_ = _encode_animated_webp(frames, anim_fps, quality, max_res)
                                     mime = "image/webp"
                             else:
@@ -749,7 +924,9 @@ class _PreviewOverrideWrapper:
                                     "delta": delta_v,
                                     "step_ms": step_ms,
                                     "avg_step_ms": avg_step_ms,
-                                    "fps": anim_fps if mime in ("video/mp4", "image/webp") else None,
+                                    "fps": float(fps_out) if mime in ("video/mp4", "image/webp") else None,
+                                    "audio": audio is not None,
+                                    "audio_spec": spec_b64,
                                 },
                                 PromptServer.instance.client_id,
                             )
@@ -845,7 +1022,8 @@ class ModelPreviewOverrideKJ(io.ComfyNode):
                     min=1,
                     max=60,
                     step=1,
-                    tooltip="Playback FPS for the animated WebP preview. Ignored when preview_frames=1.",
+                    tooltip="Playback FPS for the animated preview. Ignored when preview_frames=1, and when an "
+                            "audio_vae is connected (the clip then plays in real time with its audio).",
                 ),
                 io.Vae.Input(
                     "vae",
@@ -862,6 +1040,13 @@ class ModelPreviewOverrideKJ(io.ComfyNode):
                     tooltip="Tiny VAE decoder from models/vae_approx for true-RGB previews. "
                             "Overrides Latent2RGB and the 'vae' input.",
                 ),
+                io.Vae.Input(
+                    "audio_vae",
+                    optional=True,
+                    tooltip="Optional audio VAE for audio+video models (MiniMax H3). With preview_frames > 1 the "
+                            "audio latent is decoded each step, muxed into the animated preview played back in "
+                            "real time (preview_fps is ignored), and its spectrogram is drawn under the graphs.",
+                ),
             ],
             outputs=[io.Model.Output(tooltip="Model with preview override attached.")],
             hidden=[io.Hidden.unique_id],
@@ -869,14 +1054,14 @@ class ModelPreviewOverrideKJ(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, model, max_resolution, jpeg_quality, suppress_default_preview, preview_frames, preview_fps, vae=None, tiny_vae="none") -> io.NodeOutput:
+    def execute(cls, model, max_resolution, jpeg_quality, suppress_default_preview, preview_frames, preview_fps, vae=None, tiny_vae="none", audio_vae=None) -> io.NodeOutput:
         m = model.clone()
         m.add_wrapper_with_key(
             comfy.patcher_extension.WrappersMP.OUTER_SAMPLE,
             "kj_preview_override",
             _PreviewOverrideWrapper(
                 max_resolution, cls.hidden.unique_id, jpeg_quality, suppress_default_preview,
-                preview_frames, preview_fps, vae, tiny_vae,
+                preview_frames, preview_fps, vae, tiny_vae, audio_vae,
             ),
         )
         return io.NodeOutput(m)

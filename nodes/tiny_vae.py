@@ -49,6 +49,7 @@ def build_tae_decoder(sd):
 
 class TinyVAEDecoder:
     """Decode-only tiny VAE. decode() is float32 in [0, 1] like the TAE family; decode_video() is uint8."""
+    decodes_prefix = False   # honours frame_indices exactly
 
     def __init__(self, sd, device=None, dtype=None):
         # keys may carry a "taesd_decoder."/"decoder." prefix; strip whatever is common
@@ -102,6 +103,7 @@ def is_taehv_state_dict(sd):
 
 class TAEHVDecoder:
     """Temporal tiny VAE (madebyollin/taehv), decode only."""
+    decodes_prefix = True    # memblock state chains forward, so partial requests decode the prefix
 
     def __init__(self, sd, device=None, dtype=None):
         from comfy.taesd.taehv import TAEHV, conv
